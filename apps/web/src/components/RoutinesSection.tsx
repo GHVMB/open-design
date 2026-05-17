@@ -14,6 +14,10 @@ import { navigate } from '../router';
 
 type ProjectSummary = { id: string; name: string };
 
+type RoutinesSectionProps = {
+  onClose?: () => void;
+};
+
 type ScheduleKind = RoutineSchedule['kind'];
 
 const SCHEDULE_KINDS: { kind: ScheduleKind; label: string }[] = [
@@ -189,6 +193,34 @@ function emptyForm(): FormState {
   };
 }
 
+function formFromRoutine(routine: Routine): FormState {
+  const base = emptyForm();
+  const schedule = routine.schedule;
+  if (schedule.kind === 'hourly') {
+    base.kind = 'hourly';
+    base.minute = schedule.minute;
+  } else if (schedule.kind === 'weekly') {
+    base.kind = 'weekly';
+    base.weekday = schedule.weekday;
+    base.time = schedule.time;
+    base.timezone = schedule.timezone;
+  } else {
+    base.kind = schedule.kind;
+    base.time = schedule.time;
+    base.timezone = schedule.timezone;
+  }
+  if (routine.target.mode === 'reuse') {
+    base.mode = 'reuse';
+    base.projectId = routine.target.projectId;
+  } else {
+    base.mode = 'create_each_run';
+    base.projectId = '';
+  }
+  base.name = routine.name;
+  base.prompt = routine.prompt;
+  return base;
+}
+
 function buildSchedule(form: FormState): RoutineSchedule {
   if (form.kind === 'hourly') {
     return { kind: 'hourly', minute: form.minute };
@@ -309,7 +341,7 @@ function ScheduleEditor({
   );
 }
 
-function RunHistory({ routineId, refreshKey }: { routineId: string; refreshKey: number }) {
+function RunHistory({ routineId, refreshKey, onClose }: { routineId: string; refreshKey: number; onClose?: () => void }) {
   const [runs, setRuns] = useState<RoutineRun[] | null>(null);
 
   useEffect(() => {
@@ -345,9 +377,21 @@ function RunHistory({ routineId, refreshKey }: { routineId: string; refreshKey: 
           <button
             type="button"
             className="routines-history-link"
-            onClick={() =>
-              navigate({ kind: 'project', projectId: r.projectId, fileName: null })
-            }
+            onClick={() => {
+              // Issue #1505: deep-link to this run's specific
+              // conversation, not just the project root. Without the
+              // conversation id, parallel runs that share a project
+              // (reuse mode) all resolve to the same default
+              // conversation in the project view, which made earlier
+              // runs look "absorbed" by the latest one.
+              navigate({
+                kind: 'project',
+                projectId: r.projectId,
+                conversationId: r.conversationId ?? null,
+                fileName: null,
+              });
+              onClose?.();
+            }}
             title="Open the project this run wrote to"
           >
             Open project
@@ -359,13 +403,14 @@ function RunHistory({ routineId, refreshKey }: { routineId: string; refreshKey: 
   );
 }
 
-export function RoutinesSection() {
+export function RoutinesSection({ onClose }: RoutinesSectionProps) {
   const [routines, setRoutines] = useState<Routine[]>([]);
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState<FormState>(emptyForm);
+  const [editingId, setEditingId] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -434,16 +479,22 @@ export function RoutinesSection() {
         target,
         enabled: true,
       };
-      const res = await fetch('/api/routines', {
-        method: 'POST',
+      const isEdit = editingId !== null;
+      const url = isEdit ? `/api/routines/${editingId}` : '/api/routines';
+      const payload = isEdit
+        ? { name: body.name, prompt: body.prompt, schedule: body.schedule, target: body.target }
+        : body;
+      const res = await fetch(url, {
+        method: isEdit ? 'PATCH' : 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(body),
+        body: JSON.stringify(payload),
       });
       if (!res.ok) {
         const j = await res.json().catch(() => ({}));
-        throw new Error(j.error || `create failed: ${res.status}`);
+        throw new Error(j.error || `${isEdit ? 'update' : 'create'} failed: ${res.status}`);
       }
       setShowForm(false);
+      setEditingId(null);
       setForm(emptyForm());
       void refresh();
     } catch (err) {
@@ -516,11 +567,6 @@ export function RoutinesSection() {
       <div className="section-head">
         <div>
           <h3>Routines</h3>
-          <p className="hint">
-            Scheduled, unattended agent sessions. Each run starts a new
-            conversation — either inside an existing project, or in a fresh
-            project minted on the spot.
-          </p>
         </div>
         {!showForm ? (
           <button
@@ -570,6 +616,7 @@ export function RoutinesSection() {
 
           <fieldset className="routines-fieldset">
             <legend>Project</legend>
+
             <label className="routines-radio">
               <input
                 type="radio"
@@ -581,6 +628,7 @@ export function RoutinesSection() {
                 <small>A fresh, isolated workspace per fire.</small>
               </span>
             </label>
+
             <label className="routines-radio">
               <input
                 type="radio"
@@ -592,7 +640,8 @@ export function RoutinesSection() {
                 <small>Each run lives as a new conversation inside the project.</small>
               </span>
             </label>
-            {form.mode === 'reuse' ? (
+
+            {form.mode === 'reuse' && (
               <select
                 className="routines-project-select"
                 value={form.projectId}
@@ -606,7 +655,7 @@ export function RoutinesSection() {
                   </option>
                 ))}
               </select>
-            ) : null}
+            )}
           </fieldset>
 
           <div className="routines-form-actions">
@@ -615,13 +664,16 @@ export function RoutinesSection() {
               className="btn"
               onClick={() => {
                 setShowForm(false);
+                setEditingId(null);
                 setForm(emptyForm());
               }}
             >
               Cancel
             </button>
             <button type="submit" className="btn btn-primary" disabled={submitting}>
-              {submitting ? 'Creating…' : 'Create'}
+              {editingId
+                ? submitting ? 'Saving…' : 'Save'
+                : submitting ? 'Creating…' : 'Create'}
             </button>
           </div>
         </form>
@@ -681,6 +733,18 @@ export function RoutinesSection() {
                     <button
                       type="button"
                       className="btn"
+                      onClick={() => {
+                        setForm(formFromRoutine(r));
+                        setEditingId(r.id);
+                        setShowForm(true);
+                      }}
+                      disabled={isBusy}
+                    >
+                      Edit
+                    </button>
+                    <button
+                      type="button"
+                      className="btn"
                       onClick={() => toggleEnabled(r)}
                       disabled={isBusy}
                     >
@@ -707,7 +771,7 @@ export function RoutinesSection() {
                 </div>
                 {isExpanded ? (
                   <div className="routines-item-history">
-                    <RunHistory routineId={r.id} refreshKey={historyTick} />
+                    <RunHistory routineId={r.id} refreshKey={historyTick} onClose={onClose} />
                   </div>
                 ) : null}
               </li>

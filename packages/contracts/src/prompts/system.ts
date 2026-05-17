@@ -36,6 +36,75 @@ import { DECK_FRAMEWORK_DIRECTIVE } from './deck-framework.js';
 import { MEDIA_GENERATION_CONTRACT } from './media-contract.js';
 
 export const BASE_SYSTEM_PROMPT = OFFICIAL_DESIGNER_PROMPT;
+const ELEVENLABS_VOICE_PROMPT_OPTION_LIMIT = 100;
+
+export interface AudioVoiceOption {
+  name: string;
+  voiceId: string;
+  category?: string | null;
+  labels?: Record<string, string> | null;
+}
+
+const ELEVENLABS_VOICE_OPTIONS_PROMPT_PREFIX = 'ElevenLabs voice list could not be loaded';
+const PROMPT_SAFE_HTTP_STATUS_LABELS: Record<string, string> = {
+  '400': 'Bad Request',
+  '401': 'Unauthorized',
+  '403': 'Forbidden',
+  '404': 'Not Found',
+  '429': 'Too Many Requests',
+  '500': 'Internal Server Error',
+  '502': 'Bad Gateway',
+  '503': 'Service Unavailable',
+  '504': 'Gateway Timeout',
+};
+
+function normalizePromptText(value: string): string {
+  return value
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+export function formatElevenLabsVoiceOptionsErrorForPrompt(
+  error: string | undefined,
+): string | undefined {
+  const trimmed = normalizePromptText(error ?? '');
+  if (!trimmed) return undefined;
+
+  if (/no ElevenLabs API key/i.test(trimmed)) {
+    return `${ELEVENLABS_VOICE_OPTIONS_PROMPT_PREFIX} because the ElevenLabs API key is missing. Tell the user to configure it in Settings or paste a voice id manually.`;
+  }
+
+  const statusMatch = trimmed.match(
+    /(?:\((\d{3})(?:\s+([^)]+))?\)|\b(\d{3})(?:\s+([A-Za-z][A-Za-z -]{0,40}))?\b)/,
+  );
+  if (statusMatch) {
+    const statusCode = statusMatch[1] ?? statusMatch[3];
+    const statusText = statusCode ? PROMPT_SAFE_HTTP_STATUS_LABELS[statusCode] ?? '' : '';
+    const suffix = statusText ? ` ${statusText}` : '';
+    return `${ELEVENLABS_VOICE_OPTIONS_PROMPT_PREFIX} (${statusCode}${suffix}). Tell the user to retry the lookup or paste a voice id manually.`;
+  }
+
+  return `${ELEVENLABS_VOICE_OPTIONS_PROMPT_PREFIX}. Tell the user to retry the lookup or paste a voice id manually.`;
+}
+
+export const SKIP_DISCOVERY_BRIEF_OVERRIDE = `# Automated project mode — skip discovery form
+
+This project was created through the daemon API with \`skipDiscoveryBrief: true\`. Override the discovery rules below: do NOT emit \`<question-form id="discovery">\`, do NOT show "Quick brief — 30 seconds", and do NOT ask a first-turn clarification form. Treat the user's first message and project metadata as the brief, then proceed directly to planning/building under the normal artifact workflow. Ask at most one concise follow-up only if a required detail is impossible to infer safely.`;
+
+const ACTIVE_DESIGN_SYSTEM_VISUAL_DIRECTION_OVERRIDE = `
+
+---
+
+## Active design system visual direction
+
+Active design system exception: the active design system is the visual direction for this project. Use its DESIGN.md palette, typography, spacing, component rules, and theme tokens as the source of truth for color and mood.
+
+- Do not ask the user to pick a separate theme color, visual direction, palette, typography mood, or direction card.
+- Do not emit a direction question-form, a \`direction-cards\` picker, or any visual-direction card while an active design system is present.
+- If an earlier discovery answer asks to "Pick a direction for me", treat that as already satisfied by the active design system and continue with the plan.
+- When a downstream framework mentions "active direction" or "theme tokens", bind those fields from the active design system instead of the built-in direction library.
+`;
 
 export interface ComposeInput {
   skillBody?: string | undefined;
@@ -66,9 +135,36 @@ export interface ComposeInput {
   // Snapshot of HTML files that the agent should treat as a starting
   // reference rather than a fixed deliverable.
   template?: ProjectTemplate | undefined;
+  // Optional `## Active plugin` / `## Plugin inputs` / `## Plugin atoms`
+  // block (PB1). Daemon callers feed in `renderPluginBlock(snapshot)`;
+  // contracts-side callers running the API fallback may still pass the
+  // block through. v1 spec §11.8 routes plugin runs through the daemon
+  // (web returns 409 when a plugin is bound), so contracts callers only
+  // see this on a daemon-bound run that uses the contracts composer.
+  pluginBlock?: string | undefined;
+  // Plan §3.L2 / spec §23.4 — pre-rendered `## Active stage` blocks
+  // produced by `renderActiveStageBlock(stageId, atomBodies)`. The
+  // contracts composer simply splices them in after the plugin block;
+  // every block is already self-contained markdown.
+  activeStageBlocks?: ReadonlyArray<string> | undefined;
+  // Provider voice choices fetched by the app before composing the
+  // prompt. Used for ElevenLabs speech discovery so the agent can
+  // render a select question-form instead of asking the user to paste
+  // raw ids.
+  audioVoiceOptions?: AudioVoiceOption[] | undefined;
+  // When voice discovery fails, surface the error reason so the agent
+  // can tell the user why the dropdown is unavailable instead of
+  // pretending there were simply no voices.
+  audioVoiceOptionsError?: string | undefined;
   // When set to 'plain', suppresses tool_calls so API/BYOK-mode models
   // only emit <artifact> blocks (they cannot execute tools).
   streamFormat?: string | undefined;
+  // Free-form instructions the user set at the global (user-level)
+  // settings panel. Injected after personal memory.
+  userInstructions?: string | undefined;
+  // Free-form instructions the user set on this specific project.
+  // Injected after user-level instructions and before the design system.
+  projectInstructions?: string | undefined;
 }
 
 export function composeSystemPrompt({
@@ -80,13 +176,20 @@ export function composeSystemPrompt({
   memoryBody,
   metadata,
   template,
+  pluginBlock,
+  activeStageBlocks,
+  audioVoiceOptions,
+  audioVoiceOptionsError,
   streamFormat,
+  userInstructions,
+  projectInstructions,
 }: ComposeInput): string {
   // Discovery + philosophy goes FIRST so its hard rules ("emit a form on
   // turn 1", "branch on brand on turn 2", "TodoWrite on turn 3", run
   // checklist + critique before <artifact>) win precedence over softer
   // wording later in the official base prompt.
   const parts: string[] = [];
+  const activeDesignSystemBody = designSystemBody?.trim();
 
   // API/BYOK mode (streamFormat === 'plain'): no tools are wired through
   // to the model, but the discovery layer + base prompt below still tell
@@ -98,6 +201,11 @@ export function composeSystemPrompt({
   // later" header.
   if (streamFormat === 'plain') {
     parts.push(API_MODE_OVERRIDE);
+    parts.push('\n\n---\n\n');
+  }
+
+  if (metadata?.skipDiscoveryBrief === true) {
+    parts.push(SKIP_DISCOVERY_BRIEF_OVERRIDE);
     parts.push('\n\n---\n\n');
   }
 
@@ -120,9 +228,21 @@ export function composeSystemPrompt({
     );
   }
 
-  if (designSystemBody && designSystemBody.trim().length > 0) {
+  if (userInstructions && userInstructions.trim().length > 0) {
     parts.push(
-      `\n\n## Active design system${designSystemTitle ? ` — ${designSystemTitle}` : ''}\n\nTreat the following DESIGN.md as authoritative for color, typography, spacing, and component rules. Do not invent tokens outside this palette. When you copy the active skill's seed template, bind these tokens into its \`:root\` block before generating any layout.\n\n${designSystemBody.trim()}`,
+      `\n\n## Custom instructions (user-level)\n\nThe user has set the following persistent instructions. Apply them as defaults to every project. When a project-level instruction below contradicts a point here, the project-level version wins.\n\n${userInstructions.trim()}`,
+    );
+  }
+
+  if (projectInstructions && projectInstructions.trim().length > 0) {
+    parts.push(
+      `\n\n## Custom instructions (project-level)\n\nThe user has set the following instructions for this specific project. They take precedence over user-level custom instructions whenever both address the same topic (e.g. if user-level says "use spaces" but project-level says "use tabs", use tabs).\n\n${projectInstructions.trim()}`,
+    );
+  }
+
+  if (activeDesignSystemBody && activeDesignSystemBody.length > 0) {
+    parts.push(
+      `\n\n## Active design system${designSystemTitle ? ` — ${designSystemTitle}` : ''}\n\nTreat the following DESIGN.md as authoritative for color, typography, spacing, and component rules. Do not invent tokens outside this palette. When you copy the active skill's seed template, bind these tokens into its \`:root\` block before generating any layout.\n\n${activeDesignSystemBody}`,
     );
   }
 
@@ -133,7 +253,19 @@ export function composeSystemPrompt({
     );
   }
 
-  const metaBlock = renderMetadataBlock(metadata, template);
+  if (pluginBlock && pluginBlock.trim().length > 0) {
+    parts.push(pluginBlock);
+  }
+
+  if (Array.isArray(activeStageBlocks) && activeStageBlocks.length > 0) {
+    for (const block of activeStageBlocks) {
+      if (typeof block === 'string' && block.trim().length > 0) {
+        parts.push(block);
+      }
+    }
+  }
+
+  const metaBlock = renderMetadataBlock(metadata, template, audioVoiceOptions, audioVoiceOptionsError);
   if (metaBlock) parts.push(metaBlock);
 
   // Decks have a load-bearing framework (nav, counter, scroll JS, print
@@ -153,10 +285,24 @@ export function composeSystemPrompt({
   // `derivePreflight` above, so we only fire the generic skeleton when no
   // skill seed is on offer.
   const isDeckProject = skillMode === 'deck' || metadata?.kind === 'deck';
+  const isFreeformProject = !skillMode && (!metadata || metadata.kind === 'other');
   const hasSkillSeed =
     !!skillBody && /assets\/template\.html/.test(skillBody);
   if (isDeckProject && !hasSkillSeed) {
     parts.push(`\n\n---\n\n${DECK_FRAMEWORK_DIRECTIVE}`);
+  } else if (isFreeformProject && !hasSkillSeed) {
+    // Freeform / kind=other projects skip the kind picker entirely and
+    // land here. If the user's brief is a deck/keynote/slides ("讲解",
+    // "presentation", "make a deck"), the agent used to invent its own
+    // scale-to-fit + slide visibility + nav script from scratch and
+    // shipped subtle CSS specificity bugs (per-slide layout classes
+    // overriding `.slide { display:none }`). Inject the same framework
+    // here, prefixed with a one-line conditional so the agent only
+    // adopts it when the brief actually is a deck — otherwise the
+    // directive is read as background reference and ignored.
+    parts.push(
+      `\n\n---\n\n## If this brief is a slide deck / keynote / presentation\n\nThe user did not pre-select a "Slide deck" surface, but their request may still call for one. **If — and only if — the brief reads as slides, keynote, presentation, deck, PPT, or 讲解, follow the framework below.** Otherwise ignore everything in this section and continue with the freeform output you would have written anyway.\n\n${DECK_FRAMEWORK_DIRECTIVE}`,
+    );
   }
 
   const isMediaSurface =
@@ -168,6 +314,10 @@ export function composeSystemPrompt({
     metadata?.kind === 'audio';
   if (isMediaSurface) {
     parts.push(MEDIA_GENERATION_CONTRACT);
+  }
+
+  if (activeDesignSystemBody && activeDesignSystemBody.length > 0) {
+    parts.push(ACTIVE_DESIGN_SYSTEM_VISUAL_DIRECTION_OVERRIDE);
   }
 
   return parts.join('');
@@ -209,6 +359,8 @@ If the rules below tell you to plan with TodoWrite, write the plan as prose inst
 function renderMetadataBlock(
   metadata: ProjectMetadata | undefined,
   template: ProjectTemplate | undefined,
+  audioVoiceOptions: AudioVoiceOption[] | undefined,
+  audioVoiceOptionsError: string | undefined,
 ): string {
   if (!metadata) return '';
   const lines: string[] = [];
@@ -349,6 +501,33 @@ function renderMetadataBlock(
     } else if (metadata.audioKind === 'speech') {
       lines.push('- **voice**: (unknown - ask: voice id / accent / pacing)');
     }
+    const voiceOptions = shouldRenderElevenLabsVoiceOptions(metadata, audioVoiceOptions)
+      ? audioVoiceOptions ?? []
+      : [];
+    if (voiceOptions.length > 0) {
+      lines.push(
+        '- **ElevenLabs voice options**: Ask the user to choose from a dropdown select. The visible labels are voice descriptions; the selected value must be the exact `voice_id` passed to `--voice`. Do not ask the user to type an id.',
+      );
+      if (voiceOptions.length > ELEVENLABS_VOICE_PROMPT_OPTION_LIMIT) {
+        lines.push(`- **ElevenLabs voice options**: showing the first ${ELEVENLABS_VOICE_PROMPT_OPTION_LIMIT} of ${voiceOptions.length} available voices.`);
+      }
+      lines.push('');
+      lines.push('<question-form id="elevenlabs-voice" title="Choose an ElevenLabs voice">');
+      lines.push(JSON.stringify(renderElevenLabsVoiceQuestionForm(voiceOptions), null, 2));
+      lines.push('</question-form>');
+    } else {
+      const audioVoiceOptionsPromptError = formatElevenLabsVoiceOptionsErrorForPrompt(audioVoiceOptionsError);
+      if (audioVoiceOptionsPromptError) {
+        lines.push(
+          `- **ElevenLabs voice options**: ${audioVoiceOptionsPromptError}`,
+        );
+      }
+    }
+    if (metadata.audioKind === 'sfx') {
+      lines.push(
+        '- **SFX discovery**: Ask about the sound source/action, materials, intensity, acoustic space, timing/tail, loop/non-loop, and "avoid" constraints. Do not ask for language or voice for SFX.',
+      );
+    }
     lines.push('');
     lines.push(
       'This is an **audio** project. Lock the content intent first, then dispatch via the **media generation contract** using `"$OD_NODE_BIN" "$OD_BIN" media generate --surface audio --audio-kind <kind> --model <audioModel> --duration <seconds>` and add `--voice <voice-id>` for speech when you have a provider-specific voice id. Do NOT emit `<artifact>` HTML.',
@@ -359,6 +538,25 @@ function renderMetadataBlock(
     lines.push(
       `- **inspirationDesignSystemIds**: ${metadata.inspirationDesignSystemIds.join(', ')} — the user picked these systems as *additional* inspiration alongside the primary one. Borrow palette accents, typographic personality, or component patterns from them; don't replace the primary system's tokens.`,
     );
+  }
+
+  if (Array.isArray(metadata.contextPlugins) && metadata.contextPlugins.length > 0) {
+    lines.push('');
+    lines.push('### @ plugin context');
+    lines.push(
+      'The user selected these plugins as additive context via @ mentions. Treat them as requested references to combine with the brief; only the explicit active plugin block, if present, is the executable/pinned plugin snapshot.',
+    );
+    for (const plugin of metadata.contextPlugins) {
+      const id = typeof plugin.id === 'string' ? plugin.id : '';
+      const title = typeof plugin.title === 'string' && plugin.title.trim().length > 0
+        ? plugin.title.trim()
+        : id;
+      if (!id && !title) continue;
+      const description = typeof plugin.description === 'string' && plugin.description.trim().length > 0
+        ? ` — ${plugin.description.trim()}`
+        : '';
+      lines.push(`- ${title}${id ? ` (\`${id}\`)` : ''}${description}`);
+    }
   }
 
   // Curated prompt template reference for image/video projects. Inlined
@@ -437,6 +635,65 @@ function renderMetadataBlock(
   }
 
   return lines.join('\n');
+}
+
+function shouldRenderElevenLabsVoiceOptions(
+  metadata: ProjectMetadata,
+  audioVoiceOptions: AudioVoiceOption[] | undefined,
+): boolean {
+  return metadata.kind === 'audio'
+    && metadata.audioKind === 'speech'
+    && metadata.audioModel === 'elevenlabs-v3'
+    && !metadata.voice
+    && Array.isArray(audioVoiceOptions)
+    && audioVoiceOptions.length > 0;
+}
+
+function renderElevenLabsVoiceQuestionForm(voiceOptions: AudioVoiceOption[]): {
+  description: string;
+  questions: Array<{
+    id: string;
+    label: string;
+    type: 'select';
+    required: boolean;
+    placeholder: string;
+    help: string;
+    options: Array<{ label: string; value: string }>;
+  }>;
+  submitLabel: string;
+} {
+  const options = voiceOptions.slice(0, ELEVENLABS_VOICE_PROMPT_OPTION_LIMIT).map((option) => ({
+    label: formatElevenLabsVoiceLabel(option),
+    value: option.voiceId,
+  }));
+  return {
+    description:
+      'Pick a voice by description. The selected answer will be the exact voice_id passed to the renderer.',
+    questions: [
+      {
+        id: 'voice',
+        label: 'Voice',
+        type: 'select',
+        required: true,
+        placeholder: 'Choose a voice',
+        help: 'Select a voice description; the answer submits the matching Voice ID.',
+        options,
+      },
+    ],
+    submitLabel: 'Use voice',
+  };
+}
+
+function formatElevenLabsVoiceLabel(option: AudioVoiceOption): string {
+  const labels = option.labels && typeof option.labels === 'object'
+    ? Object.values(option.labels)
+        .map((value) => (typeof value === 'string' ? value.trim() : ''))
+        .filter(Boolean)
+    : [];
+  const bits = [...labels];
+  if (bits.length > 0) return `${option.name} — ${bits.join(' · ')}`;
+  const category = typeof option.category === 'string' ? option.category.trim() : '';
+  return category ? `${option.name} — ${category}` : option.name;
 }
 
 /**

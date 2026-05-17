@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type CSSProperties,
 } from 'react';
@@ -262,7 +263,7 @@ function formatDuration(record: MemoryExtractionRecord): string | null {
   return `${Math.round(ms / 1000)}s`;
 }
 
-type FlashKind = 'created' | 'saved' | 'deleted' | 'indexSaved';
+type FlashKind = 'created' | 'saved' | 'deleted' | 'indexSaved' | 'pathCopied';
 
 export function MemorySection() {
   const t = useT();
@@ -275,6 +276,7 @@ export function MemorySection() {
   const [previewBody, setPreviewBody] = useState<string | null>(null);
   const [editing, setEditing] = useState<DraftEntry | null>(null);
   const [busy, setBusy] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [filter, setFilter] = useState<'all' | MemoryType>('all');
   // Brief inline confirmation after a manual save/create/delete. The
   // form vanishes on success and the existing list re-renders, but
@@ -283,6 +285,9 @@ export function MemorySection() {
   const [flash, setFlash] = useState<{ kind: FlashKind; key: number } | null>(
     null,
   );
+  const editorRef = useRef<HTMLDivElement | null>(null);
+  const editorNameRef = useRef<HTMLInputElement | null>(null);
+  const editingTarget = editing?.id ?? (editing ? 'new' : null);
   // Recent LLM-extraction attempts, newest first. Driven by a one-shot
   // fetch on mount + live SSE updates merged by id so phase transitions
   // (running → success) replace the row in place.
@@ -298,15 +303,43 @@ export function MemorySection() {
     return () => clearTimeout(id);
   }, [flash]);
 
+  useEffect(() => {
+    if (!editingTarget) return;
+    editorRef.current?.scrollIntoView?.({ block: 'start', behavior: 'smooth' });
+    editorNameRef.current?.focus({ preventScroll: true });
+  }, [editingTarget]);
+
   const flashLabel = useMemo<Record<FlashKind, string>>(
     () => ({
       created: t('settings.memoryFlashCreated'),
       saved: t('settings.memoryFlashSaved'),
       deleted: t('settings.memoryFlashDeleted'),
       indexSaved: t('settings.memoryFlashIndexSaved'),
+      pathCopied: t('settings.memoryFlashPathCopied'),
     }),
     [t],
   );
+
+  const onCopyPath = useCallback(async () => {
+    if (!rootDir) return;
+    try {
+      await navigator.clipboard.writeText(rootDir);
+      fireFlash('pathCopied');
+    } catch {
+      // Some sandboxed contexts block clipboard writes silently. Fall
+      // back to a transient input so the user can still grab the path
+      // with a manual select-all + copy.
+      const input = document.createElement('input');
+      input.value = rootDir;
+      input.style.position = 'fixed';
+      input.style.opacity = '0';
+      document.body.appendChild(input);
+      input.select();
+      document.execCommand('copy');
+      document.body.removeChild(input);
+      fireFlash('pathCopied');
+    }
+  }, [rootDir, fireFlash]);
 
   const TYPE_LABEL: Record<MemoryType, string> = useMemo(
     () => ({
@@ -327,7 +360,12 @@ export function MemorySection() {
   }, []);
 
   const reloadExtractions = useCallback(async () => {
-    setExtractions(await fetchExtractions());
+    setIsRefreshing(true);
+    try {
+      setExtractions(await fetchExtractions());
+    } finally {
+      setIsRefreshing(false);
+    }
   }, []);
 
   useEffect(() => {
@@ -534,10 +572,43 @@ export function MemorySection() {
   }, [reloadExtractions]);
 
   return (
-    <section className={`settings-section${enabled ? '' : ' is-disabled'}`}>
+    <section
+      className={`settings-section settings-section-card${enabled ? '' : ' is-disabled'}`}
+    >
       <div className="section-head">
         <div>
-          <h3>{t('settings.memory')}</h3>
+          <h3 className="memory-title-row">
+            <span>{t('settings.memory')}</span>
+            {/*
+              Storage path used to render as a permanently-visible
+              <code>/Users/.../.od/memory</code> line in the body. Most
+              users only need this once (to peek at the markdown files)
+              and then never again, so the line was pure noise after the
+              first glance. We tucked it behind an info button next to
+              the title: native tooltip on hover reveals the full path,
+              and a click copies it to clipboard with a "Path copied"
+              flash. Inline English for the aria-label; PR-time
+              translation sweep can lift it later.
+            */}
+            {rootDir ? (
+              <span className="memory-info-wrap">
+                <button
+                  type="button"
+                  className="memory-info-btn"
+                  onClick={() => void onCopyPath()}
+                  title={rootDir}
+                  aria-label="Memory storage path — click to copy"
+                >
+                  <Icon name="info" size={13} />
+                </button>
+                {flash?.kind === 'pathCopied' ? (
+                  <span key={flash.key} className="memory-path-copied-badge">
+                    {flashLabel.pathCopied}
+                  </span>
+                ) : null}
+              </span>
+            ) : null}
+          </h3>
           <p className="hint">{t('settings.memoryDescription')}</p>
         </div>
         <label
@@ -566,12 +637,6 @@ export function MemorySection() {
           <strong>{t('settings.memoryNoProviderBannerTitle')}</strong> —{' '}
           {t('settings.memoryNoProviderBannerBody')}
         </div>
-      ) : null}
-
-      {rootDir ? (
-        <p className="hint memory-root-dir">
-          <code>{rootDir}</code>
-        </p>
       ) : null}
 
       <div className="library-toolbar is-row">
@@ -611,7 +676,7 @@ export function MemorySection() {
         </button>
       </div>
 
-      {flash ? (
+      {flash && flash.kind !== 'pathCopied' ? (
         <div
           key={flash.key}
           role="status"
@@ -624,6 +689,7 @@ export function MemorySection() {
 
       {editing ? (
         <div
+          ref={editorRef}
           className="library-card"
           style={{
             flexDirection: 'column',
@@ -692,6 +758,7 @@ export function MemorySection() {
                   {t('settings.memoryNameLabel')}
                 </label>
                 <input
+                  ref={editorNameRef}
                   type="text"
                   placeholder={t('settings.memoryName')}
                   value={editing.name}
@@ -798,20 +865,37 @@ export function MemorySection() {
 
       <div className="library-content">
         {filtered.length === 0 ? (
-          <p className="library-empty">
-            {t('settings.memoryEmpty')}{' '}
-            <code>{t('settings.memoryEmptyHintZh')}</code> /{' '}
-            <code>{t('settings.memoryEmptyHintEn')}</code>
-          </p>
+          /*
+            Empty state — the previous one inlined two side-by-side
+            <code> snippets ("记住：用户偏好深色主题 / I prefer dark
+            mode") which read like duelling locales and made the user
+            wonder if the chips were tap-to-prefill or just decorative.
+            We now show one clear "no rows yet" line and a one-sentence
+            primer that explains the mechanism (talk in chat, fact gets
+            extracted) with a single example. Inline English; PR-time
+            translation sweep can lift this into the dictionary.
+          */
+          <div className="library-empty">
+            <p className="library-empty-title">
+              {t('settings.memoryEmpty')}
+            </p>
+            <p className="library-empty-hint">
+              Tell the assistant a fact in chat — e.g.{' '}
+              <code>I prefer dark mode</code> — and it will be saved
+              here automatically.
+            </p>
+          </div>
         ) : (
-          TYPES.filter((tt) => grouped.has(tt)).map((type) => (
+          TYPES.filter((tt) => grouped.has(tt)).map((type, _i, arr) => (
             <div key={type} className="library-group">
-              <h4 className="library-group-title">
-                {TYPE_LABEL[type]}{' '}
-                <span className="library-group-count">
-                  {grouped.get(type)!.length}
-                </span>
-              </h4>
+              {arr.length > 1 ? (
+                <h4 className="library-group-title">
+                  {TYPE_LABEL[type]}{' '}
+                  <span className="library-group-count">
+                    {grouped.get(type)!.length}
+                  </span>
+                </h4>
+              ) : null}
               {grouped.get(type)!.map((entry) => (
                 <div key={entry.id} className="library-card">
                   <div className="library-card-info">
@@ -830,7 +914,7 @@ export function MemorySection() {
                     title={t('settings.memoryPreview')}
                   >
                     <Icon
-                      name={previewId === entry.id ? 'close' : 'chevron-right'}
+                      name={previewId === entry.id ? 'chevron-down' : 'chevron-right'}
                       size={14}
                     />
                   </button>
@@ -870,18 +954,11 @@ export function MemorySection() {
         )}
       </div>
 
-      <details className="library-group memory-extractions" style={{ marginTop: 16 }}>
-        <summary
-          style={{
-            cursor: 'pointer',
-            fontWeight: 600,
-            padding: '6px 0',
-            display: 'flex',
-            alignItems: 'center',
-            gap: 8,
-          }}
-        >
-          <span>{t('settings.memoryExtractions')}</span>
+      <details className="library-group memory-extractions memory-collapsible-card">
+        <summary className="memory-details-summary">
+          <span className="memory-details-title">
+            {t('settings.memoryExtractions')}
+          </span>
           {extractions.length > 0 ? (
             <span className="filter-pill-count">{extractions.length}</span>
           ) : null}
@@ -895,17 +972,20 @@ export function MemorySection() {
             </span>
           ) : null}
         </summary>
-        <p className="hint" style={{ marginTop: 4, marginBottom: 8 }}>
-          {t('settings.memoryExtractionsHint')}
-        </p>
         <div
           style={{
             display: 'flex',
-            justifyContent: 'flex-end',
-            gap: 6,
+            flexDirection: 'row',
+            alignItems: 'center',
+            gap: 8,
+            marginTop: 8,
             marginBottom: 8,
           }}
         >
+          <span style={{ flex: 1, fontSize: 12, color: 'var(--text-muted)', margin: 0 }}>
+            {t('settings.memoryExtractionsHint')}
+          </span>
+          <div style={{ display: 'flex', gap: 6, flexShrink: 0 }}>
           {extractions.length > 0 ? (
             <button
               type="button"
@@ -923,14 +1003,16 @@ export function MemorySection() {
             type="button"
             className="ghost"
             onClick={() => void reloadExtractions()}
+            disabled={isRefreshing}
             title={t('settings.memoryExtractionsRefresh')}
           >
-            <Icon name="refresh" size={12} />{' '}
+            <Icon name="refresh" size={12} className={isRefreshing ? 'icon-spin' : ''} />{' '}
             <span style={{ marginLeft: 4 }}>
-              {t('settings.memoryExtractionsRefresh')}
+              {isRefreshing ? t('settings.memoryExtractionsRefreshing') : t('settings.memoryExtractionsRefresh')}
             </span>
           </button>
-        </div>
+          </div>{/* end buttons */}
+        </div>{/* end hint+buttons row */}
         {extractions.length === 0 ? (
           <p className="library-empty">{t('settings.memoryExtractionsEmpty')}</p>
         ) : (
@@ -1036,15 +1118,11 @@ export function MemorySection() {
         )}
       </details>
 
-      <details className="library-group" style={{ marginTop: 16 }}>
-        <summary
-          style={{
-            cursor: 'pointer',
-            fontWeight: 600,
-            padding: '6px 0',
-          }}
-        >
-          {t('settings.memoryIndex')}
+      <details className="library-group memory-collapsible-card">
+        <summary className="memory-details-summary">
+          <span className="memory-details-title">
+            {t('settings.memoryIndex')}
+          </span>
         </summary>
         <textarea
           value={indexDraft ?? index}

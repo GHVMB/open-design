@@ -1,4 +1,4 @@
-import type { ChatMessage } from './chat.js';
+import type { ChatMessage, ChatRunStatus } from './chat.js';
 
 export type ProjectKind =
   | 'prototype'
@@ -113,6 +113,13 @@ export interface ProjectMetadata {
   promptTemplate?: PromptTemplateMetadata;
   // Absolute paths to local code folders the agent can read via --add-dir.
   linkedDirs?: string[];
+  // Batch/API-created projects can opt out of the initial discovery form so
+  // the first agent turn builds immediately from the submitted brief.
+  skipDiscoveryBrief?: boolean;
+  // Plugins selected through @ mentions on Home. These are additive
+  // context references; the explicit "Use plugin" snapshot, when present,
+  // remains the primary executable plugin for the run.
+  contextPlugins?: Array<{ id: string; title: string; description?: string }>;
 }
 
 export interface Project {
@@ -125,6 +132,13 @@ export interface Project {
   status?: ProjectStatusInfo;
   pendingPrompt?: string;
   metadata?: ProjectMetadata;
+  // Plan §3.A1 / spec §11.5 — set when the project was created with a
+  // plugin pinned (e.g. via PluginLoopHome on the web entry). Lets the
+  // UI hide the in-composer plugin rail and render the active plugin
+  // as context on user messages instead of re-prompting the user to
+  // pick a plugin they already selected.
+  appliedPluginSnapshotId?: string;
+  customInstructions?: string;
 }
 
 export interface ProjectTemplate {
@@ -142,6 +156,12 @@ export interface Conversation {
   title: string | null;
   createdAt: number;
   updatedAt: number;
+  latestRun?: {
+    status: ChatRunStatus;
+    startedAt?: number;
+    endedAt?: number;
+    durationMs?: number;
+  };
 }
 
 export interface CreateProjectRequest {
@@ -150,6 +170,12 @@ export interface CreateProjectRequest {
   designSystemId?: string | null;
   pendingPrompt?: string;
   metadata?: ProjectMetadata;
+  pluginId?: string;
+  appliedPluginSnapshotId?: string;
+  pluginInputs?: Record<string, unknown>;
+  customInstructions?: string;
+  /** Persisted to metadata.skipDiscoveryBrief for automated project runs. */
+  skipDiscoveryBrief?: boolean;
 }
 
 export interface UpdateProjectRequest {
@@ -158,6 +184,7 @@ export interface UpdateProjectRequest {
   designSystemId?: string | null;
   pendingPrompt?: string | null;
   metadata?: ProjectMetadata | null;
+  customInstructions?: string | null;
 }
 
 export interface ProjectsResponse {
@@ -181,6 +208,7 @@ export interface ProjectDetailResponse extends ProjectResponse {
 
 export interface CreateProjectResponse extends ProjectResponse {
   conversationId?: string;
+  appliedPluginSnapshotId?: string;
 }
 
 // POST /api/import/folder — create a project rooted at an existing local

@@ -27,6 +27,10 @@
 //                              /v1/images/generations for grok-imagine-image
 //                              and async /v1/videos/generations + GET poll
 //                              for grok-imagine-video (t2v + i2v + audio)
+//   * provider 'imagerouter'→ ImageRouter OpenAI-compatible image/video
+//                              generation endpoints
+//   * provider 'custom-image'→ user-supplied OpenAI-compatible
+//                              /v1/images/generations endpoint
 //
 // The fallback stub handlers are gated behind OD_MEDIA_ALLOW_STUBS=1; in
 // release builds they throw StubProviderDisabledError (mapped to HTTP
@@ -53,7 +57,7 @@ import {
   findProvider,
   modelsForSurface,
 } from './media-models.js';
-import { resolveProviderConfig } from './media-config.js';
+import { resolveModelAlias, resolveProviderConfig } from './media-config.js';
 import {
   ensureProject,
   kindFor,
@@ -67,7 +71,29 @@ type ProgressFn = (message: string) => void;
 type ImageRef = { path: string; abs: string; mime: string; size: number; dataUrl: string };
 type MediaContext = {
   surface: MediaSurface;
+  /**
+   * Registered catalog id (e.g. `dall-e-3`, `gpt-4o-mini-tts`,
+   * `doubao-seedream-3-0-t2i-250415`). Every model-family branch in
+   * the renderers below keys off this field so DALL·E sizing,
+   * gpt-image quality, gpt-4o-mini-tts instructions, and the
+   * MINIMAX/FISHAUDIO TTS lookup tables continue to fire even when
+   * the user has aliased the catalog id to a custom wire-name via
+   * issue #1277's alias layer. lefarcen + codex P2 review on PR
+   * #1309 caught the regression where a single `ctx.model` doubled
+   * for both purposes and accidentally disabled the capability
+   * branches under aliasing.
+   */
   model: string;
+  /**
+   * What the provider's request body should carry as `model` (or
+   * what gets templated into the URL for Azure-style deployment
+   * routing). Equal to `model` when no alias is configured; equal
+   * to the user-supplied alias from `OD_MEDIA_MODEL_ALIASES` /
+   * `media-config.json` otherwise. Renderers must use this field
+   * for `body.model = ...` and for `providerNote` so users see
+   * what was actually sent.
+   */
+  wireModel: string;
   modelDef: MediaModel;
   provider: MediaProvider | null;
   prompt: string;
@@ -77,6 +103,8 @@ type MediaContext = {
   voice: string;
   audioKind: AudioKind | undefined;
   language: string;
+  loop: boolean;
+  promptInfluence: number | undefined;
   compositionDir: string | null;
   imageRef: ImageRef | null;
 };
@@ -99,6 +127,8 @@ const NANOBANANA_DEFAULT_BASE_URL = 'https://generativelanguage.googleapis.com';
 // https://ai.google.dev/gemini-api/docs/models
 const NANOBANANA_DEFAULT_MODEL = 'gemini-3.1-flash-image-preview';
 const NANOBANANA_DEFAULT_IMAGE_SIZE = '1K';
+const IMAGEROUTER_DEFAULT_BASE_URL = 'https://api.imagerouter.io/v1/openai';
+const CUSTOM_IMAGE_MODEL_ID = 'custom-image';
 
 const DEFAULT_OUTPUT_BY_SURFACE = {
   image: 'image.png',
@@ -253,7 +283,8 @@ function clampWithWarning(value: unknown, allowed: number[], flagName: string): 
 export async function generateMedia(args: {
   projectRoot: string; projectsRoot: string; projectId: string; surface: MediaSurface; model: string;
   prompt?: string; output?: string; aspect?: string; length?: number; duration?: number; voice?: string;
-  audioKind?: AudioKind; language?: string; compositionDir?: string; image?: string; onProgress?: ProgressFn;
+  audioKind?: AudioKind; language?: string; loop?: boolean; promptInfluence?: number;
+  compositionDir?: string; image?: string; onProgress?: ProgressFn;
 }) {
   const {
     projectRoot,
@@ -269,6 +300,8 @@ export async function generateMedia(args: {
     voice,
     audioKind,
     language,
+    loop,
+    promptInfluence,
     compositionDir,
     image,
   } = args;
@@ -319,12 +352,18 @@ export async function generateMedia(args: {
     surface === 'video'
       ? clampWithWarning(length, VIDEO_LENGTHS_SEC, 'length')
       : { value: undefined, warning: null };
+  const usesProviderSpecificAudioDuration =
+    def.provider === 'elevenlabs'
+    && surface === 'audio'
+    && resolvedAudioKind === 'sfx';
   const durationClamp =
-    surface === 'audio'
+    surface === 'audio' && !usesProviderSpecificAudioDuration
       ? clampWithWarning(duration, AUDIO_DURATIONS_SEC, 'duration')
       : { value: undefined, warning: null };
   const clampedLength = lengthClamp.value;
-  const clampedDuration = durationClamp.value;
+  const clampedDuration = usesProviderSpecificAudioDuration
+    ? duration
+    : durationClamp.value;
   const warnings = [lengthClamp.warning, durationClamp.warning].filter(Boolean);
 
   const dir = await ensureProject(projectsRoot, projectId);
@@ -341,9 +380,19 @@ export async function generateMedia(args: {
   // and decide how to splice the data URL into their request.
   const imageRef = await resolveProjectImage(image, dir);
 
+  // Resolve any user-configured model alias BEFORE we hand the id to a
+  // dispatcher (issue #1277). Catalog lookup + surface validation above
+  // ran against the original id so we still enforce the registered
+  // catalog; the alias only changes what the provider receives on the
+  // wire. lefarcen + codex P2 on PR #1309: keep BOTH values on ctx so
+  // capability branches (DALL-E sizing, gpt-image quality, gpt-4o-mini-tts
+  // instructions, MINIMAX/FISHAUDIO TTS map) continue to key off the
+  // catalog id while the provider's request body carries the alias.
+  const wireModel = await resolveModelAlias(projectRoot, model);
   const ctx = {
     surface,
     model,
+    wireModel,
     modelDef: def,
     provider: findProvider(def.provider),
     prompt: prompt || '',
@@ -353,6 +402,10 @@ export async function generateMedia(args: {
     voice: voice || '',
     audioKind: resolvedAudioKind,
     language: language || '',
+    loop: loop === true,
+    promptInfluence: typeof promptInfluence === 'number' && Number.isFinite(promptInfluence)
+      ? promptInfluence
+      : undefined,
     // Project-relative path to the directory the agent scaffolded with
     // hyperframes.json / meta.json / index.html. Only consumed by the
     // hyperframes renderer; null/empty for every other provider.
@@ -363,10 +416,15 @@ export async function generateMedia(args: {
   };
 
   const credentials = await resolveProviderConfig(projectRoot, def.provider);
+  const customImageCredentials =
+    surface === 'image' && def.provider === 'openai'
+      ? await resolveProviderConfig(projectRoot, 'custom-image')
+      : null;
 
   let bytes: Buffer;
   let providerNote: string;
   let suggestedExt: string | undefined;
+  let providerId = def.provider;
   // Tracks whether the bytes came from a real provider call or from the
   // stub fallback. Surfaces in the response so the CLI/agent can tell a
   // legitimate placeholder ("provider not integrated yet") apart from a
@@ -379,7 +437,17 @@ export async function generateMedia(args: {
   // no real renderer is wired up for this (provider, surface) pair.
   let intentionalStub = false;
   try {
-    if (def.provider === 'openai' && surface === 'image') {
+    if (
+      def.provider === 'openai'
+      && surface === 'image'
+      && customImageOverridesOpenAIModel(ctx, customImageCredentials)
+    ) {
+      providerId = 'custom-image';
+      const result = await renderCustomOpenAIImage(ctx, customImageCredentials!);
+      bytes = result.bytes;
+      providerNote = result.providerNote;
+      suggestedExt = result.suggestedExt;
+    } else if (def.provider === 'openai' && surface === 'image') {
       const result = await renderOpenAIImage(ctx, credentials);
       bytes = result.bytes;
       providerNote = result.providerNote;
@@ -418,6 +486,44 @@ export async function generateMedia(args: {
       bytes = result.bytes;
       providerNote = result.providerNote;
       suggestedExt = result.suggestedExt;
+    } else if (def.provider === 'imagerouter' && surface === 'image') {
+      const result = await renderImageRouterImage(ctx, credentials);
+      bytes = result.bytes;
+      providerNote = result.providerNote;
+      suggestedExt = result.suggestedExt;
+    } else if (def.provider === 'imagerouter' && surface === 'video') {
+      const result = await renderImageRouterVideo(ctx, credentials);
+      bytes = result.bytes;
+      providerNote = result.providerNote;
+      suggestedExt = result.suggestedExt;
+    } else if (def.provider === 'custom-image' && surface === 'image') {
+      const result = await renderCustomOpenAIImage(ctx, credentials);
+      bytes = result.bytes;
+      providerNote = result.providerNote;
+      suggestedExt = result.suggestedExt;
+    } else if (def.provider === 'leonardo' && surface === 'image') {
+      const result = await renderLeonardoImage(ctx, credentials);
+      bytes = result.bytes;
+      providerNote = result.providerNote;
+      suggestedExt = result.suggestedExt;
+    } else if (
+      def.provider === 'elevenlabs'
+      && surface === 'audio'
+      && ctx.audioKind === 'speech'
+    ) {
+      const result = await renderElevenLabsTTS(ctx, credentials);
+      bytes = result.bytes;
+      providerNote = result.providerNote;
+      suggestedExt = result.suggestedExt;
+    } else if (
+      def.provider === 'elevenlabs'
+      && surface === 'audio'
+      && ctx.audioKind === 'sfx'
+    ) {
+      const result = await renderElevenLabsSfx(ctx, credentials);
+      bytes = result.bytes;
+      providerNote = result.providerNote;
+      suggestedExt = result.suggestedExt;
     } else if (def.provider === 'hyperframes' && surface === 'video') {
       // HyperFrames is templated by the agent (it reads the vendored
       // skill at skills/hyperframes/SKILL.md and writes a composition
@@ -436,6 +542,11 @@ export async function generateMedia(args: {
       suggestedExt = result.suggestedExt;
     } else if (def.provider === 'minimax' && surface === 'audio') {
       const result = await renderMinimaxTTS(ctx, credentials);
+      bytes = result.bytes;
+      providerNote = result.providerNote;
+      suggestedExt = result.suggestedExt;
+    } else if (def.provider === 'senseaudio' && surface === 'audio') {
+      const result = await renderSenseAudioTTS(ctx, credentials);
       bytes = result.bytes;
       providerNote = result.providerNote;
       suggestedExt = result.suggestedExt;
@@ -474,14 +585,14 @@ export async function generateMedia(args: {
     const stub = await renderStub(ctx, safeOut);
     bytes = stub.bytes;
     const msg = errorMessage(err);
-    providerNote = `[${def.provider} error → stub] ${msg}`;
+    providerNote = `[${providerId} error → stub] ${msg}`;
     providerError = msg;
     usedStubFallback = true;
     // Also log to daemon stderr so the failure is visible in the daemon
     // terminal — easiest place for the developer/operator to spot it.
     try {
       console.error(
-        `[media] ${def.provider}/${surface}/${model} failed: ${msg}`,
+        `[media] ${providerId}/${surface}/${model} failed: ${msg}`,
       );
     } catch {
       // best-effort logging only
@@ -518,7 +629,7 @@ export async function generateMedia(args: {
     model,
     surface,
     providerNote,
-    providerId: def.provider,
+    providerId,
     providerError,
     usedStubFallback,
     intentionalStub,
@@ -582,12 +693,15 @@ async function renderOpenAIImage(ctx: MediaContext, credentials: ProviderConfig)
   };
   // For non-Azure calls, include `model` in the body. Azure infers it
   // from the deployment in the path so omitting it keeps payloads
-  // compatible across both flavors.
+  // compatible across both flavors. The wire-name (post-alias) goes
+  // on the body so the user's alias from issue #1277 reaches the API.
   if (!azure) {
-    body.model = ctx.model;
+    body.model = ctx.wireModel;
   }
-  // gpt-image-* returns b64_json by default and rejects response_format,
-  // so we only pass it for dall-e-* (where it's required).
+  // Capability branches key off the CATALOG id (not the alias) so a
+  // user who aliased `dall-e-3` to a custom Azure / proxy deployment
+  // still gets the DALL-E-specific quality + response_format flags
+  // (lefarcen + codex P2 on PR #1309).
   if (ctx.model.startsWith('dall-e-')) {
     body.response_format = 'b64_json';
     body.quality = ctx.model === 'dall-e-3' ? 'hd' : 'standard';
@@ -642,9 +756,180 @@ async function renderOpenAIImage(ctx: MediaContext, credentials: ProviderConfig)
   const tag = azure ? 'azure-openai' : 'openai';
   return {
     bytes,
-    providerNote: `${tag}/${ctx.model} · ${ctx.aspect} · ${bytes.length} bytes`,
+    providerNote: `${tag}/${ctx.wireModel} · ${ctx.aspect} · ${bytes.length} bytes`,
     suggestedExt: '.png',
   };
+}
+
+async function renderImageRouterImage(ctx: MediaContext, credentials: ProviderConfig): Promise<RenderResult> {
+  if (!credentials.apiKey) {
+    throw new Error(
+      'no ImageRouter API key — configure it in Settings or set OD_IMAGEROUTER_API_KEY',
+    );
+  }
+  const baseUrl = (credentials.baseUrl || IMAGEROUTER_DEFAULT_BASE_URL).trim();
+  const wireModel = (credentials.model || ctx.wireModel).trim();
+  const url = buildOpenAIImageUrl(baseUrl, false);
+  const body: Record<string, unknown> = {
+    prompt: ctx.prompt || 'A high-quality reference image.',
+    model: wireModel,
+    quality: 'auto',
+    size: imageRouterSizeFor(ctx.aspect, 'image'),
+    response_format: 'b64_json',
+    output_format: 'png',
+  };
+
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'authorization': `Bearer ${credentials.apiKey}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+  const data = await parseOpenAICompatibleJson(resp, 'imagerouter image');
+  const bytes = await bytesFromOpenAICompatibleData(data, 'imagerouter image');
+  return {
+    bytes,
+    providerNote: `imagerouter/${wireModel} · ${imageRouterSizeFor(ctx.aspect, 'image')} · ${bytes.length} bytes`,
+    suggestedExt: sniffImageExt(bytes),
+  };
+}
+
+async function renderImageRouterVideo(ctx: MediaContext, credentials: ProviderConfig): Promise<RenderResult> {
+  if (!credentials.apiKey) {
+    throw new Error(
+      'no ImageRouter API key — configure it in Settings or set OD_IMAGEROUTER_API_KEY',
+    );
+  }
+  const baseUrl = (credentials.baseUrl || IMAGEROUTER_DEFAULT_BASE_URL).trim();
+  const wireModel = (credentials.model || ctx.wireModel).trim();
+  const url = buildOpenAIVideoUrl(baseUrl);
+  const seconds = typeof ctx.length === 'number' ? ctx.length : 'auto';
+  const body: Record<string, unknown> = {
+    prompt: ctx.prompt || 'A short cinematic clip.',
+    model: wireModel,
+    size: imageRouterSizeFor(ctx.aspect, 'video'),
+    seconds,
+    response_format: 'b64_json',
+  };
+
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'authorization': `Bearer ${credentials.apiKey}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+  const data = await parseOpenAICompatibleJson(resp, 'imagerouter video');
+  const bytes = await bytesFromOpenAICompatibleData(data, 'imagerouter video');
+  return {
+    bytes,
+    providerNote: `imagerouter/${wireModel} · ${imageRouterSizeFor(ctx.aspect, 'video')} · ${seconds === 'auto' ? 'auto' : `${seconds}s`} · ${bytes.length} bytes`,
+    suggestedExt: '.mp4',
+  };
+}
+
+async function renderCustomOpenAIImage(ctx: MediaContext, credentials: ProviderConfig): Promise<RenderResult> {
+  const baseUrl = (credentials.baseUrl || '').trim();
+  if (!baseUrl) {
+    throw new Error(
+      'Custom Image API base URL required — configure a /v1/images/generations compatible endpoint in Settings',
+    );
+  }
+  const wireModel = (
+    credentials.model
+    || (ctx.wireModel !== CUSTOM_IMAGE_MODEL_ID ? ctx.wireModel : '')
+  ).trim();
+  if (!wireModel) {
+    throw new Error(
+      'Custom Image API model required — configure the provider model in Settings',
+    );
+  }
+
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+  };
+  if (credentials.apiKey) {
+    headers.authorization = `Bearer ${credentials.apiKey}`;
+  }
+  const body: Record<string, unknown> = {
+    prompt: ctx.prompt || 'A high-quality reference image.',
+    model: wireModel,
+    n: 1,
+    size: openaiSizeFor('gpt-image-1', ctx.aspect),
+  };
+
+  const resp = await fetch(buildOpenAIImageUrl(baseUrl, false), {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+  const data = await parseOpenAICompatibleJson(resp, 'custom image');
+  const bytes = await bytesFromOpenAICompatibleData(data, 'custom image');
+  return {
+    bytes,
+    providerNote: `custom-image/${wireModel} · ${body.size} · ${bytes.length} bytes`,
+    suggestedExt: sniffImageExt(bytes),
+  };
+}
+
+function customImageOverridesOpenAIModel(
+  ctx: MediaContext,
+  credentials: ProviderConfig | null,
+): credentials is ProviderConfig {
+  const baseUrl = credentials?.baseUrl?.trim();
+  const model = credentials?.model?.trim();
+  if (!baseUrl || !model) return false;
+  return model === ctx.model || model === ctx.wireModel;
+}
+
+async function parseOpenAICompatibleJson(resp: Response, providerTag: string): Promise<any> {
+  const text = await resp.text();
+  if (!resp.ok) {
+    throw new Error(`${providerTag} ${resp.status}: ${truncate(text, 240)}`);
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`${providerTag} non-JSON response: ${truncate(text, 200)}`);
+  }
+}
+
+async function bytesFromOpenAICompatibleData(data: any, providerTag: string): Promise<Buffer> {
+  const entry = data && Array.isArray(data.data) ? data.data[0] : null;
+  if (!entry) throw new Error(`${providerTag} response had no data[0]`);
+  if (typeof entry.b64_json === 'string' && entry.b64_json) {
+    const raw = entry.b64_json.includes(',')
+      ? entry.b64_json.slice(entry.b64_json.indexOf(',') + 1)
+      : entry.b64_json;
+    return Buffer.from(raw, 'base64');
+  }
+  if (typeof entry.url === 'string' && entry.url) {
+    const mediaResp = await fetch(entry.url);
+    if (!mediaResp.ok) {
+      throw new Error(`${providerTag} media fetch ${mediaResp.status}`);
+    }
+    const arr = await mediaResp.arrayBuffer();
+    return Buffer.from(arr);
+  }
+  throw new Error(`${providerTag} response had neither b64_json nor url`);
+}
+
+function imageRouterSizeFor(aspect: string | undefined, surface: 'image' | 'video'): string {
+  if (surface === 'video') {
+    if (aspect === '1:1') return '1024x1024';
+    if (aspect === '9:16') return '576x1024';
+    if (aspect === '4:3') return '1024x768';
+    if (aspect === '3:4') return '768x1024';
+    return '1024x576';
+  }
+  if (aspect === '16:9') return '1024x576';
+  if (aspect === '9:16') return '576x1024';
+  if (aspect === '4:3') return '1024x768';
+  if (aspect === '3:4') return '768x1024';
+  return '1024x1024';
 }
 
 /**
@@ -672,21 +957,39 @@ function detectAzureEndpoint(baseUrl: string): boolean {
  * appending the default api-version for Azure when the user didn't
  * specify one. Returns a string ready for `fetch`.
  */
-function buildOpenAIImageUrl(baseUrl: string, isAzure: boolean): string {
+function buildOpenAICompatibleGenerationUrl(baseUrl: string, endpoint: 'images' | 'videos'): string {
+  const suffix = `/${endpoint}/generations`;
   let parsed;
   try {
     parsed = new URL(baseUrl);
   } catch {
+    const stripped = baseUrl.replace(/\/$/, '');
+    return stripped.endsWith(suffix) ? stripped : `${stripped}${suffix}`;
+  }
+  const strippedPath = parsed.pathname.replace(/\/+$/, '');
+  if (!strippedPath.endsWith(suffix)) {
+    parsed.pathname = `${strippedPath}${suffix}`;
+  }
+  return parsed.toString();
+}
+
+function buildOpenAIImageUrl(baseUrl: string, isAzure: boolean): string {
+  let parsed;
+  try {
+    parsed = new URL(buildOpenAICompatibleGenerationUrl(baseUrl, 'images'));
+  } catch {
     // Bad URL — fall back to naive concat so the upstream error is
     // surfaced through the normal HTTP path rather than a parse crash.
-    const stripped = baseUrl.replace(/\/$/, '');
-    return `${stripped}/images/generations`;
+    return buildOpenAICompatibleGenerationUrl(baseUrl, 'images');
   }
-  parsed.pathname = parsed.pathname.replace(/\/+$/, '') + '/images/generations';
   if (isAzure && !parsed.searchParams.has('api-version')) {
     parsed.searchParams.set('api-version', AZURE_DEFAULT_API_VERSION);
   }
   return parsed.toString();
+}
+
+function buildOpenAIVideoUrl(baseUrl: string): string {
+  return buildOpenAICompatibleGenerationUrl(baseUrl, 'videos');
 }
 
 function openaiSizeFor(model: string, aspect?: string): string {
@@ -777,7 +1080,7 @@ async function renderOpenAISpeech(ctx: MediaContext, credentials: ProviderConfig
     response_format: format,
   };
   if (!azure) {
-    body.model = ctx.model;
+    body.model = ctx.wireModel;
   }
   if (instructions && ctx.model === 'gpt-4o-mini-tts') {
     body.instructions = instructions;
@@ -807,7 +1110,7 @@ async function renderOpenAISpeech(ctx: MediaContext, credentials: ProviderConfig
     throw new Error('openai speech returned zero bytes');
   }
   const tag = azure ? 'azure-openai' : 'openai';
-  const noteBits = [`${tag}/${ctx.model}`, voiceId, `${format}`, `${bytes.length} bytes`];
+  const noteBits = [`${tag}/${ctx.wireModel}`, voiceId, `${format}`, `${bytes.length} bytes`];
   if (instructions) noteBits.splice(2, 0, 'styled');
   return {
     bytes,
@@ -865,7 +1168,7 @@ async function renderVolcengineVideo(ctx: MediaContext, credentials: ProviderCon
   }
 
   const taskBody = {
-    model: ctx.model,
+    model: ctx.wireModel,
     content,
   };
 
@@ -955,7 +1258,7 @@ async function renderVolcengineVideo(ctx: MediaContext, credentials: ProviderCon
 
   return {
     bytes,
-    providerNote: `volcengine/${ctx.model} · ${ratio} · ${durationSec}s · ${bytes.length} bytes`,
+    providerNote: `volcengine/${ctx.wireModel} · ${ratio} · ${durationSec}s · ${bytes.length} bytes`,
     suggestedExt: '.mp4',
   };
 }
@@ -979,9 +1282,12 @@ async function renderVolcengineImage(ctx: MediaContext, credentials: ProviderCon
   const baseUrl = (credentials.baseUrl || 'https://ark.cn-beijing.volces.com/api/v3').replace(/\/$/, '');
 
   const body = {
-    model: ctx.model,
+    model: ctx.wireModel,
     prompt: ctx.prompt || 'A high-quality reference image.',
     response_format: 'b64_json',
+    // openaiSizeFor branches on the catalog id (gpt-image-* vs dall-e-*
+    // accept different size enums), so it must NOT see the post-alias
+    // wire name. lefarcen + codex P2 on PR #1309.
     size: openaiSizeFor(ctx.model, ctx.aspect),
   };
   const resp = await fetch(`${baseUrl}/images/generations`, {
@@ -1016,7 +1322,7 @@ async function renderVolcengineImage(ctx: MediaContext, credentials: ProviderCon
   }
   return {
     bytes,
-    providerNote: `volcengine/${ctx.model} · ${ctx.aspect} · ${bytes.length} bytes`,
+    providerNote: `volcengine/${ctx.wireModel} · ${ctx.aspect} · ${bytes.length} bytes`,
     suggestedExt: '.png',
   };
 }
@@ -1049,7 +1355,7 @@ async function renderGrokImage(ctx: MediaContext, credentials: ProviderConfig): 
 
   const aspectRatio = grokAspectFor(ctx.aspect);
   const body = {
-    model: ctx.model,
+    model: ctx.wireModel,
     prompt: ctx.prompt || 'A high-quality reference image.',
     n: 1,
     aspect_ratio: aspectRatio,
@@ -1092,7 +1398,7 @@ async function renderGrokImage(ctx: MediaContext, credentials: ProviderConfig): 
   // trusts the extension.
   return {
     bytes,
-    providerNote: `grok/${ctx.model} · ${aspectRatio} · ${bytes.length} bytes`,
+    providerNote: `grok/${ctx.wireModel} · ${aspectRatio} · ${bytes.length} bytes`,
     suggestedExt: sniffImageExt(bytes),
   };
 }
@@ -1105,7 +1411,7 @@ async function renderNanoBananaImage(ctx: MediaContext, credentials: ProviderCon
   }
 
   const baseUrl = (credentials.baseUrl || NANOBANANA_DEFAULT_BASE_URL).replace(/\/$/, '');
-  const wireModel = (credentials.model || ctx.model || NANOBANANA_DEFAULT_MODEL).trim();
+  const wireModel = (credentials.model || ctx.wireModel || NANOBANANA_DEFAULT_MODEL).trim();
   const body = {
     contents: [{
       parts: [{
@@ -1212,6 +1518,135 @@ function sniffImageExt(bytes: Buffer): string {
   return '.png';
 }
 
+async function renderLeonardoImage(ctx: MediaContext, credentials: ProviderConfig): Promise<RenderResult> {
+  if (!credentials.apiKey) {
+    throw new Error(
+      'no Leonardo.ai API key — configure it in Settings or set LEONARDO_API_KEY',
+    );
+  }
+  const baseUrl = (credentials.baseUrl || 'https://cloud.leonardo.ai/api/rest/v1').replace(/\/$/, '');
+  
+  // Map model IDs to Leonardo.ai platform model IDs
+  const modelMap: Record<string, string> = {
+    'leonardo-phoenix': '6b645e3a-d64f-4341-a6d8-7a3690fbf042',  // Phoenix
+    'leonardo-kino-xl': 'aa77f04e-3eec-4034-9c07-d0f619684628',  // Kino XL
+    'leonardo-flux-dev': 'b2614463-296c-462a-9586-aafdb8f00e36', // FLUX.1 [dev]
+    'leonardo-flux-schnell': '1dd50843-d653-4516-a8e3-f0238ee453ff', // FLUX.1 [schnell]
+    'leonardo-anime-pastel': '1e60896f-3c26-4296-8ecc-53e2afecc132', // Anime Pastel Dream
+  };
+  
+  const platformModelId = modelMap[ctx.model];
+  if (!platformModelId) {
+    throw new Error(`unsupported leonardo.ai model: ${ctx.model}`);
+  }
+  
+  // Map aspect ratios to Leonardo.ai dimensions
+  const aspectMap: Record<string, { width: number; height: number }> = {
+    '1:1': { width: 1024, height: 1024 },
+    '16:9': { width: 1344, height: 768 },
+    '9:16': { width: 768, height: 1344 },
+    '4:3': { width: 1152, height: 896 },
+    '3:4': { width: 896, height: 1152 },
+  };
+  
+  const size = (ctx.aspect ? aspectMap[ctx.aspect] : undefined) || { width: 1024, height: 1024 };
+  
+  // Submit generation request. Phoenix and the FLUX family require the
+  // `contrast` field per Leonardo's API reference; valid values are
+  // 3 (Low) / 3.5 (Medium) / 4 (High). Default to 3.5 so prompts that
+  // omit a contrast hint fall in the middle of the supported range.
+  const requiresContrast =
+    ctx.model === 'leonardo-phoenix'
+    || ctx.model === 'leonardo-flux-dev'
+    || ctx.model === 'leonardo-flux-schnell';
+  const body: Record<string, unknown> = {
+    prompt: ctx.prompt || 'A high-quality reference image.',
+    modelId: platformModelId,
+    width: size.width,
+    height: size.height,
+    num_images: 1,
+    ...(requiresContrast ? { contrast: 3.5 } : {}),
+  };
+  
+  const submitResp = await fetch(`${baseUrl}/generations`, {
+    method: 'POST',
+    headers: {
+      'authorization': `Bearer ${credentials.apiKey}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+  
+  const submitText = await submitResp.text();
+  if (!submitResp.ok) {
+    throw new Error(`leonardo.ai submit ${submitResp.status}: ${truncate(submitText, 240)}`);
+  }
+  
+  let submitData: any;
+  try {
+    submitData = JSON.parse(submitText);
+  } catch {
+    throw new Error(`leonardo.ai non-JSON: ${truncate(submitText, 200)}`);
+  }
+  
+  const generationId = submitData?.sdGenerationJob?.generationId;
+  if (!generationId) {
+    throw new Error('leonardo.ai response missing generationId');
+  }
+  
+  // Poll for completion
+  const maxPollMs = 120000; // 2 minutes
+  const pollIntervalMs = 2000; // 2 seconds
+  const startedAt = Date.now();
+  let imageUrl: string | null = null;
+  
+  while (Date.now() - startedAt < maxPollMs) {
+    await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+    
+    const pollResp = await fetch(`${baseUrl}/generations/${generationId}`, {
+      headers: {
+        'authorization': `Bearer ${credentials.apiKey}`,
+      },
+    });
+    
+    if (!pollResp.ok) {
+      throw new Error(`leonardo.ai poll ${pollResp.status}`);
+    }
+    
+    const pollData = (await pollResp.json()) as Record<string, any>;
+    const generation = pollData?.generations_by_pk;
+    
+    if (generation?.status === 'COMPLETE') {
+      const images = generation?.generated_images;
+      if (Array.isArray(images) && images.length > 0) {
+        imageUrl = images[0]?.url;
+        break;
+      }
+    } else if (generation?.status === 'FAILED') {
+      throw new Error('leonardo.ai generation failed');
+    }
+  }
+  
+  if (!imageUrl) {
+    throw new Error('leonardo.ai generation timed out after 2 minutes');
+  }
+  
+  // Fetch the generated image
+  const imgResp = await fetch(imageUrl);
+  if (!imgResp.ok) {
+    throw new Error(`leonardo.ai image fetch ${imgResp.status}`);
+  }
+  
+  const bytes = Buffer.from(await imgResp.arrayBuffer());
+  
+  return {
+    bytes,
+    providerNote: `leonardo.ai/${ctx.model} · ${ctx.aspect} · ${bytes.length} bytes`,
+    suggestedExt: sniffImageExt(bytes),
+  };
+}
+
+
 async function renderGrokVideo(ctx: MediaContext, credentials: ProviderConfig, onProgress?: ProgressFn): Promise<RenderResult> {
   if (!credentials.apiKey) {
     throw new Error(
@@ -1228,7 +1663,7 @@ async function renderGrokVideo(ctx: MediaContext, credentials: ProviderConfig, o
   const aspectRatio = grokAspectFor(ctx.aspect);
 
   const body: Record<string, unknown> = {
-    model: ctx.model,
+    model: ctx.wireModel,
     prompt: ctx.prompt || 'A short cinematic clip.',
     duration: durationSec,
     aspect_ratio: aspectRatio,
@@ -1342,7 +1777,7 @@ async function renderGrokVideo(ctx: MediaContext, credentials: ProviderConfig, o
 
   return {
     bytes,
-    providerNote: `grok/${ctx.model} · ${aspectRatio} · ${durationSec}s · ${bytes.length} bytes`,
+    providerNote: `grok/${ctx.wireModel} · ${aspectRatio} · ${durationSec}s · ${bytes.length} bytes`,
     suggestedExt: '.mp4',
   };
 }
@@ -1361,6 +1796,161 @@ function grokAspectFor(aspect?: string): string {
     return aspect;
   }
   return '16:9';
+}
+
+// ---------------------------------------------------------------------------
+// Provider: ElevenLabs — v3 text-to-speech (synchronous).
+//
+// Docs: https://elevenlabs.io/docs/api-reference/text-to-speech/convert
+// The API returns MP3 bytes directly. The catalogue id `elevenlabs-v3`
+// maps to the wire model `eleven_v3`, while `--voice` selects the
+// voice id in the path.
+// ---------------------------------------------------------------------------
+
+const ELEVENLABS_DEFAULT_BASE_URL = 'https://api.elevenlabs.io';
+const ELEVENLABS_DEFAULT_VOICE_ID = '21m00Tcm4TlvDq8ikWAM';
+
+const ELEVENLABS_TTS_MODEL_MAP = {
+  'elevenlabs-v3': 'eleven_v3',
+} as Record<string, string>;
+
+const ELEVENLABS_SFX_MODEL_MAP = {
+  'elevenlabs-sfx': 'eleven_text_to_sound_v2',
+} as Record<string, string>;
+const ELEVENLABS_SFX_MAX_PROMPT_CHARS = 450;
+const ELEVENLABS_SFX_DEFAULT_PROMPT_INFLUENCE = 0.3;
+
+function clampElevenLabsSfxDuration(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 5;
+  return Math.min(30, Math.max(0.5, value));
+}
+
+function clampElevenLabsSfxPromptInfluence(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return ELEVENLABS_SFX_DEFAULT_PROMPT_INFLUENCE;
+  }
+  return Math.min(1, Math.max(0, value));
+}
+
+function requireElevenLabsPrompt(text: string, kind: 'TTS' | 'SFX'): string {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    throw new Error(`ElevenLabs ${kind} prompt must not be empty. Pass --prompt before retrying.`);
+  }
+  return trimmed;
+}
+
+function assertElevenLabsSfxPromptLength(text: string) {
+  const promptChars = Array.from(text).length;
+  if (promptChars > ELEVENLABS_SFX_MAX_PROMPT_CHARS) {
+    throw new Error(
+      `ElevenLabs SFX prompt exceeds ${ELEVENLABS_SFX_MAX_PROMPT_CHARS} characters (${promptChars}). Shorten --prompt before retrying.`,
+    );
+  }
+}
+
+async function renderElevenLabsTTS(ctx: MediaContext, credentials: ProviderConfig): Promise<RenderResult> {
+  if (!credentials.apiKey) {
+    throw new Error(
+      'no ElevenLabs API key - configure it in Settings or set OD_ELEVENLABS_API_KEY',
+    );
+  }
+
+  const baseUrl = (credentials.baseUrl || ELEVENLABS_DEFAULT_BASE_URL).replace(
+    /\/$/,
+    '',
+  );
+  const wireModel = ELEVENLABS_TTS_MODEL_MAP[ctx.model] || ctx.model;
+  const text = requireElevenLabsPrompt(ctx.prompt ?? '', 'TTS');
+  const voiceId = (ctx.voice && ctx.voice.trim()) || ELEVENLABS_DEFAULT_VOICE_ID;
+  const body = {
+    text,
+    model_id: wireModel,
+    voice_settings: {
+      stability: 1,
+      similarity_boost: 1,
+      style: 0,
+      speed: 1,
+      use_speaker_boost: true,
+    },
+  };
+
+  const resp = await fetch(
+    `${baseUrl}/v1/text-to-speech/${encodeURIComponent(voiceId)}?output_format=mp3_44100_128`,
+    {
+      method: 'POST',
+      headers: {
+        'xi-api-key': credentials.apiKey,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    },
+  );
+  if (!resp.ok) {
+    const errText = await resp.text();
+    throw new Error(`elevenlabs tts ${resp.status}: ${truncate(errText, 240)}`);
+  }
+  const arr = await resp.arrayBuffer();
+  const bytes = Buffer.from(arr);
+  if (bytes.length === 0) {
+    throw new Error('elevenlabs tts returned zero bytes');
+  }
+  return {
+    bytes,
+    providerNote: `elevenlabs/${wireModel} · ${voiceId} · ${bytes.length} bytes`,
+    suggestedExt: '.mp3',
+  };
+}
+
+async function renderElevenLabsSfx(ctx: MediaContext, credentials: ProviderConfig): Promise<RenderResult> {
+  if (!credentials.apiKey) {
+    throw new Error(
+      'no ElevenLabs API key - configure it in Settings or set OD_ELEVENLABS_API_KEY',
+    );
+  }
+
+  const baseUrl = (credentials.baseUrl || ELEVENLABS_DEFAULT_BASE_URL).replace(
+    /\/$/,
+    '',
+  );
+  const wireModel = ELEVENLABS_SFX_MODEL_MAP[ctx.model] || ctx.model;
+  const text = requireElevenLabsPrompt(ctx.prompt ?? '', 'SFX');
+  assertElevenLabsSfxPromptLength(text);
+  const durationSeconds = clampElevenLabsSfxDuration(ctx.duration);
+  const promptInfluence = clampElevenLabsSfxPromptInfluence(ctx.promptInfluence);
+  const body = {
+    text,
+    duration_seconds: durationSeconds,
+    prompt_influence: promptInfluence,
+    ...(ctx.loop ? { loop: true } : {}),
+    model_id: wireModel,
+  };
+
+  const resp = await fetch(
+    `${baseUrl}/v1/sound-generation?output_format=mp3_44100_128`,
+    {
+      method: 'POST',
+      headers: {
+        'xi-api-key': credentials.apiKey,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    },
+  );
+  if (!resp.ok) {
+    const errText = await resp.text();
+    throw new Error(`elevenlabs sfx ${resp.status}: ${truncate(errText, 240)}`);
+  }
+  const arr = await resp.arrayBuffer();
+  const bytes = Buffer.from(arr);
+  if (bytes.length === 0) {
+    throw new Error('elevenlabs sfx returned zero bytes');
+  }
+  return {
+    bytes,
+    providerNote: `elevenlabs/${wireModel} · ${durationSeconds}s${ctx.loop ? ' · loop' : ''} · ${bytes.length} bytes`,
+    suggestedExt: '.mp3',
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1395,7 +1985,13 @@ async function renderMinimaxTTS(ctx: MediaContext, credentials: ProviderConfig):
     /\/$/,
     '',
   );
-  const wireModel = MINIMAX_TTS_MODEL_MAP[ctx.model] || ctx.model;
+  // Precedence: user alias from #1277 (when set) -> project's known
+  // MINIMAX legacy rename map -> catalog id. The user knows their
+  // deployment name better than our hardcoded table, so an explicit
+  // alias trumps the legacy mapping.
+  const wireModel = ctx.wireModel !== ctx.model
+    ? ctx.wireModel
+    : (MINIMAX_TTS_MODEL_MAP[ctx.model] || ctx.model);
   const text = (ctx.prompt && ctx.prompt.trim()) || 'This is a test.';
   // Voice id picks: the agent can pass --voice to choose, otherwise we
   // default to a neutral Mandarin male voice that handles both Chinese
@@ -1471,6 +2067,109 @@ async function renderMinimaxTTS(ctx: MediaContext, credentials: ProviderConfig):
 }
 
 // ---------------------------------------------------------------------------
+// Provider: SenseAudio — senseaudio-tts-1.5 text-to-speech (synchronous).
+//
+// Docs: https://docs.senseaudio.cn — POST /v1/t2a_v2 with a JSON body
+// shaped like MiniMax's (voice_setting / audio_setting). The response is
+// JSON with hex-encoded audio under `data.audio` and a `base_resp`
+// envelope that distinguishes HTTP-level from API-level failures, again
+// mirroring MiniMax. The catalogue id we surface as `senseaudio-tts`
+// resolves to `senseaudio-tts-1.5-260319` on the wire — SenseAudio's
+// recommended flagship model (supports emotion control, polyphonic
+// characters, LaTeX formula reading, voice cloning, and text-generated
+// voices). Default voice is `female_0033_b` per the official example; the agent
+// can override via the model registry's `voice` slot with any system,
+// cloned, or text-generated voice id from the customer's catalogue.
+// Audio shape is hard-coded to mp3 / 32kHz / 128kbps / stereo for parity
+// with the other TTS providers; SenseAudio supports wav/pcm/flac and
+// other sample rates but we don't expose them through MediaContext yet.
+// ---------------------------------------------------------------------------
+
+const SENSEAUDIO_DEFAULT_BASE_URL = 'https://api.senseaudio.cn';
+const SENSEAUDIO_DEFAULT_VOICE_ID = 'female_0033_b';
+
+const SENSEAUDIO_TTS_MODEL_MAP = {
+  'senseaudio-tts': 'senseaudio-tts-1.5-260319',
+} as Record<string, string>;
+
+async function renderSenseAudioTTS(ctx: MediaContext, credentials: ProviderConfig): Promise<RenderResult> {
+  if (!credentials.apiKey) {
+    throw new Error(
+      'no SenseAudio API key — configure it in Settings or set OD_SENSEAUDIO_API_KEY',
+    );
+  }
+  const baseUrl = (credentials.baseUrl || SENSEAUDIO_DEFAULT_BASE_URL).replace(
+    /\/$/,
+    '',
+  );
+  const wireModel = SENSEAUDIO_TTS_MODEL_MAP[ctx.model] || ctx.model;
+  const text = (ctx.prompt && ctx.prompt.trim()) || 'This is a test.';
+  const voiceId = (ctx.voice && ctx.voice.trim()) || SENSEAUDIO_DEFAULT_VOICE_ID;
+
+  const body = {
+    model: wireModel,
+    text,
+    stream: false,
+    voice_setting: {
+      voice_id: voiceId,
+      speed: 1,
+      vol: 1,
+      pitch: 0,
+    },
+    audio_setting: {
+      format: 'mp3',
+      sample_rate: 32000,
+      bitrate: 128000,
+      channel: 2,
+    },
+  };
+
+  const resp = await fetch(`${baseUrl}/v1/t2a_v2`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${credentials.apiKey}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+  const respText = await resp.text();
+  if (!resp.ok) {
+    throw new Error(`senseaudio tts ${resp.status}: ${truncate(respText, 240)}`);
+  }
+  let data: any;
+  try {
+    data = JSON.parse(respText);
+  } catch {
+    throw new Error(`senseaudio tts non-JSON: ${truncate(respText, 200)}`);
+  }
+  // SenseAudio mirrors MiniMax's base_resp envelope: HTTP 200 can still
+  // be a logical failure (auth, quota, voice not on this account, …).
+  // Surface the upstream status_code/status_msg so users see the real
+  // cause instead of a downstream "missing data.audio" red herring.
+  if (data?.base_resp && data.base_resp.status_code !== 0) {
+    throw new Error(
+      `senseaudio tts api error ${data.base_resp.status_code}: ${data.base_resp.status_msg || 'unknown'}`,
+    );
+  }
+  const hex = data?.data?.audio;
+  if (typeof hex !== 'string' || !hex) {
+    throw new Error('senseaudio tts response missing data.audio');
+  }
+  const bytes = Buffer.from(hex, 'hex');
+  if (bytes.length === 0) {
+    throw new Error('senseaudio tts decoded zero bytes');
+  }
+  const xi = data?.extra_info || {};
+  const seconds = xi.audio_length ? Math.round(xi.audio_length / 100) / 10 : '?';
+
+  return {
+    bytes,
+    providerNote: `senseaudio/${wireModel} · ${voiceId} · ${seconds}s · ${bytes.length} bytes`,
+    suggestedExt: '.mp3',
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Provider: FishAudio — Speech-1.x family text-to-speech (synchronous).
 //
 // Docs: https://docs.fish.audio — POST /v1/tts with a JSON body.
@@ -1498,7 +2197,11 @@ async function renderFishAudioTTS(ctx: MediaContext, credentials: ProviderConfig
     /\/$/,
     '',
   );
-  const wireModel = FISHAUDIO_TTS_MODEL_MAP[ctx.model] || ctx.model;
+  // Same precedence as the MINIMAX TTS path: user alias wins, then
+  // the project's hardcoded fishaudio map, then catalog id.
+  const wireModel = ctx.wireModel !== ctx.model
+    ? ctx.wireModel
+    : (FISHAUDIO_TTS_MODEL_MAP[ctx.model] || ctx.model);
   const text = (ctx.prompt && ctx.prompt.trim()) || 'This is a test.';
 
   // FishAudio's `reference_id` slot pins which voice the synth uses.

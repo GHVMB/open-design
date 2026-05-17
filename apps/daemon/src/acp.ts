@@ -4,7 +4,18 @@ import path from 'node:path';
 
 const ACP_PROTOCOL_VERSION = 1;
 const DEFAULT_TIMEOUT_MS = 15_000;
-const DEFAULT_STAGE_TIMEOUT_MS = 180_000;
+// Gap-between-chunks watchdog for an ACP session stage. The timer resets on
+// every line received from the agent, so this bounds *silent* periods, not
+// total runtime. Default kept in line with the outer chat-run inactivity
+// watchdog (10 min) so agents that spend several minutes silently writing
+// large artifacts do not get killed before the outer watchdog can apply.
+// Callers can override via `stageTimeoutMs`; the chat server reads
+// `OD_ACP_STAGE_TIMEOUT_MS` from the environment.
+// A non-positive `stageTimeoutMs` (`<= 0`) disables the watchdog entirely,
+// mirroring the outer chat watchdog's escape-hatch semantics — without this,
+// `OD_ACP_STAGE_TIMEOUT_MS=0` would call `setTimeout(..., 0)` and fail every
+// ACP session on the next tick instead of disabling the watchdog.
+const DEFAULT_STAGE_TIMEOUT_MS = 600_000;
 
 type JsonRpcId = string | number;
 type JsonObject = Record<string, unknown>;
@@ -427,8 +438,15 @@ export function attachAcpSession({
   let aborted = false;
   let stageTimer: TimerHandle | null = null;
 
+  const stageWatchdogDisabled = stageTimeoutMs <= 0;
   const resetStageTimer = (label: string) => {
     if (stageTimer) clearTimeout(stageTimer);
+    // `stageTimeoutMs <= 0` disables the watchdog. Mirrors the outer chat
+    // inactivity watchdog escape hatch (see server.ts → inactivityTimer).
+    // Without this, an operator setting `OD_ACP_STAGE_TIMEOUT_MS=0` would
+    // schedule a 0ms timeout that fires on the next tick and kills the
+    // session immediately.
+    if (stageWatchdogDisabled) return;
     stageTimer = setTimeout(() => {
       fail(`ACP ${label} timed out after ${stageTimeoutMs}ms`);
     }, stageTimeoutMs);
@@ -621,6 +639,19 @@ export function attachAcpSession({
       finished = true;
       clearStageTimer();
       stdin.end();
+      // Some ACP agents (e.g. Devin for Terminal) keep the child process
+      // alive after stdin closes, waiting for the next prompt. Each Open
+      // Design run spawns its own agent process per turn, so the child must
+      // terminate for `child.on('close')` to fire and the chat run to
+      // finalize — otherwise the chat stays stuck in the "working" state.
+      // Give the child a short grace period to exit on its own first; if it
+      // doesn't, SIGTERM forces it. This mirrors the pattern in
+      // detectAcpModels() which already kills the child after a clean
+      // model-discovery probe completes (see line ~270 in this file).
+      const cleanExitTimer = setTimeout(() => {
+        if (!child.killed) child.kill('SIGTERM');
+      }, 500);
+      child.once('close', () => clearTimeout(cleanExitTimer));
       return;
     }
     if (sessionId && model && model !== 'default' && obj.id === expectedId) {
@@ -647,6 +678,13 @@ export function attachAcpSession({
   return {
     hasFatalError() {
       return fatal;
+    },
+    completedSuccessfully() {
+      // Returns true when the prompt request resolved without a fatal error
+      // and was not aborted. The chat consumer treats this as a successful
+      // run even if the child process subsequently exited via SIGTERM
+      // (which is expected for agents that don't shut down on stdin.end()).
+      return finished && !fatal && !aborted;
     },
     abort() {
       if (aborted || finished) return;
