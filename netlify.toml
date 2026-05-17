@@ -1,0 +1,30 @@
+[build]
+  command = "pnpm install && pnpm --filter @open-design/web build"
+  publish = "apps/web/out"
+  functions = "netlify/functions"
+  edge_functions = "netlify/edge-functions"
+
+[build.environment]
+  NODE_VERSION = "20"
+  PNPM_VERSION = "10.33.2"
+  NODE_ENV = "production"
+
+[[edge_functions]]
+  path = "/api/proxy/anthropic/stream"
+  function = "proxy-anthropic"
+
+[[edge_functions]]
+  path = "/api/proxy/openai/stream"
+  function = "proxy-openai"
+
+[[edge_functions]]
+  path = "/api/proxy/azure/stream"
+  function = "proxy-azure"
+
+[[edge_functions]]
+  path = "/api/proxy/google/stream"
+  function = "proxy-google"
+
+[[edge_functions]]
+  path = "/api/proxy/ollama/stream"
+  function = "proxy-ollama"

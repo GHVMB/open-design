@@ -57,3 +57,6 @@ specs/change/active
 .envrc
 # Local design assistant context
 .impeccable.md
+
+# Netlify local build cache
+.netlify/
